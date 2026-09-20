@@ -48,7 +48,7 @@ use super::{sort_threads_recent, AgentSession, ResumeTarget, SessionLimits};
 use crate::core::agent::events::{describe_tool_call, StreamEvent, Usage};
 use crate::core::agent::git;
 use crate::core::agent::r#loop::{
-    run_orchestration_streamed, OrchestrationArgs, PermissionRegistry,
+    run_orchestration_steered, OrchestrationArgs, PermissionRegistry, SteeringRequest,
 };
 use serde_json::Value;
 use tauri_plugin_agent_tools::tools::gate::PermissionDecision;
@@ -857,7 +857,36 @@ impl AccountLoginPrompt {
 /// A spawned agent run: the event stream and its abort handle.
 struct CurrentRun {
     rx: mpsc::UnboundedReceiver<StreamEvent>,
+    steering: mpsc::UnboundedReceiver<SteeringRequest>,
     handle: JoinHandle<()>,
+}
+
+enum RunEvent {
+    Stream(Option<StreamEvent>),
+    Steering(SteeringRequest),
+}
+
+struct PendingMessage {
+    text: String,
+    message: serde_json::Value,
+    images: Vec<String>,
+    display: bool,
+    invocation: Option<(String, String, String)>,
+    run_mode: Option<crate::core::agent::plan::RunMode>,
+}
+
+#[cfg(test)]
+impl From<&str> for PendingMessage {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            message: serde_json::json!({ "role": "user", "content": text }),
+            images: Vec::new(),
+            display: true,
+            invocation: None,
+            run_mode: None,
+        }
+    }
 }
 
 /// One folded call's retained detail, so an expanded group can reconstruct each
@@ -1012,7 +1041,7 @@ const BANNER_HINTS: &[(&str, &str)] = &[
     ("/init", "onboard this project"),
     ("/model", "switch model"),
     ("/resume", "reopen a session"),
-    ("Ctrl-D", "quit"),
+    ("Ctrl-C/D twice", "quit"),
 ];
 
 fn banner_lines(banner: &Banner, width: u16) -> Vec<Line<'static>> {
@@ -1891,6 +1920,10 @@ struct App {
     /// Lines scrolled back from the tail; 0 pins the view to the bottom so new
     /// content follows. Non-zero survives streaming so scroll-back stays usable.
     scrollback: u16,
+    /// Ctrl-L or a resize requests a full repaint before the next frame.
+    /// Foreign TTY writes bypass ratatui's buffers, so ordinary diffs cannot
+    /// repair them. Clear only on request, never on every frame.
+    repaint: bool,
     /// Set when the user submits a message; the loop spawns a run next tick.
     want_start: bool,
     /// Turns (model roundtrips, plus the submission that kicked off a run)
@@ -1910,7 +1943,8 @@ struct App {
     view_width: u16,
     last_kind: Kind,
     should_quit: bool,
-    /// A blank idle composer has armed the exit: the first Ctrl-C only warns,
+    /// A blank idle composer has armed the exit: the first Ctrl-C/Ctrl-D only
+    /// warns,
     /// so leaving the TUI always takes a deliberate second one. Cleared by any
     /// key that resumes composing.
     exit_armed: bool,
@@ -1971,9 +2005,8 @@ struct App {
     copy_request: Option<String>,
     /// (when, line count) of the last copy, for the transient dock notice.
     copied: Option<(Instant, usize)>,
-    /// Messages queued while a run is in progress, dequeued automatically
-    /// when the current turn finishes.
-    message_queue: std::collections::VecDeque<String>,
+    /// Pending input, consumed at the next safe loop boundary or next run.
+    message_queue: std::collections::VecDeque<PendingMessage>,
     /// Canonical session todo list projection, kept in sync via
     /// `StreamEvent::TodoUpdate`. Empty = no todos declared this session.
     todos: crate::core::agent::todo::TodoList,
@@ -2346,6 +2379,7 @@ impl App {
             retry_after_compact: false,
             overflow_retries: 0,
             scrollback: 0,
+            repaint: false,
             want_start: false,
             turns_since_todos_closed: 0,
             todos_closed_at: None,
@@ -2486,6 +2520,18 @@ impl App {
     fn clear_selection(&mut self) {
         self.selection = None;
         self.copy_armed = false;
+    }
+
+    /// Owe a full repaint on the next frame. A pure display operation: it
+    /// leaves the draft, scroll position, and run state alone, so it is safe
+    /// to request from any mode, mid-turn included.
+    fn request_repaint(&mut self) {
+        self.repaint = true;
+    }
+
+    /// Take the pending full-repaint request, if there is one.
+    fn take_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.repaint)
     }
 
     /// Line count of a copy recent enough to still advertise, if any.
@@ -3601,11 +3647,6 @@ impl App {
         self.refresh_path_hints();
     }
 
-    /// Queue a user message: record it in history and the transcript, and ask
-    /// the loop to start a run. Flips to `Running` synchronously so further keys
-    /// in the same input batch can't slip through as a second submit.
-    /// When already running, the message is enqueued instead and auto-submitted
-    /// when the current turn finishes.
     /// Advance the spinner by however many whole `SPINNER_ADVANCE_MS` frames
     /// have elapsed since the last advance (0 if under one frame, >1 on catch-up
     /// after a stalled tick). The baseline moves forward by whole frames only so
@@ -3638,24 +3679,6 @@ impl App {
             self.note("not signed in — run /login to choose a provider first");
             return;
         }
-        // If a turn is already in progress, enqueue the message instead
-        if self.status == Status::Running {
-            self.message_queue.push_back(text.clone());
-            self.note(&format!(
-                "⏳ message queued ({} in queue)",
-                self.message_queue.len()
-            ));
-            return;
-        }
-        // Mid-prompt `/skill:<name>` token: dispatch to the skill, threading
-        // the surrounding prose as its arguments (queued messages re-enter
-        // this method via `dequeue_next`, so the token is re-parsed there too).
-        if let Some((name, args)) = crate::core::agent::skills::parse_invocation(&text) {
-            if self.dispatch_skill(&name, &args) {
-                return;
-            }
-        }
-        self.ensure_base_snapshot();
         let images = if display {
             std::mem::take(&mut self.pending_images)
         } else {
@@ -3670,16 +3693,58 @@ impl App {
         } else {
             format!("{clean_text}\n\n---\nReferenced file contents:\n\n{injected_contents}")
         };
-        self.history.push(build_user_message(&final_text, &images));
-        if display {
-            self.push_user_line(&text, &names);
-            // The typed text, not `final_text`: `@path` expansions are context
-            // for the model, and the row never showed them.
+        let invocation =
+            crate::core::agent::skills::parse_invocation(&text).and_then(|(name, args)| {
+                crate::core::agent::skills::build_invocation_message(
+                    &self.project_root,
+                    &name,
+                    &args,
+                )
+                .ok()
+                .map(|(message, description)| (name, args, message, description))
+            });
+        let model_text = invocation
+            .as_ref()
+            .map_or(final_text.as_str(), |(_, _, message, _)| message.as_str());
+        let pending = PendingMessage {
+            message: build_user_message(model_text, &images),
+            invocation: invocation.map(|(name, args, _, description)| (name, args, description)),
+            text,
+            images: names,
+            display,
+            run_mode: Some(self.run_mode),
+        };
+        if self.status == Status::Running {
+            self.message_queue.push_back(pending);
+            self.note(&format!(
+                "message pending for next agent step ({} pending)",
+                self.message_queue.len()
+            ));
+            return;
+        }
+        self.start_pending_message(pending);
+    }
+
+    fn record_pending_message(&mut self, pending: PendingMessage) {
+        self.history.push(pending.message);
+        if pending.display {
+            let text = if let Some((name, args, description)) = pending.invocation {
+                self.push_invocation_row(&format!("[skill:{name}]"), &args, &description);
+                format!("[skill:{name}] {args}")
+            } else {
+                self.push_user_line(&pending.text, &pending.images);
+                pending.text
+            };
             self.display_log.push(DisplayEntry::User {
-                text: text.clone(),
-                images: names,
+                text,
+                images: pending.images,
             });
         }
+    }
+
+    fn start_pending_message(&mut self, pending: PendingMessage) {
+        self.ensure_base_snapshot();
+        self.record_pending_message(pending);
         self.begin_turn();
         // A fresh user turn is new context: allow the next boundary to remind
         // again even if the open work is unchanged (dedup is "twice in a row"),
@@ -3844,13 +3909,51 @@ impl App {
             .message_queue
             .pop_front()
             .expect("checked non-empty above");
-        if !next.is_empty() {
+        if !next.text.is_empty() || !next.images.is_empty() {
             self.note(&format!(
                 "⏩ dequeuing next message ({} remaining)",
                 self.message_queue.len()
             ));
-            self.submit_user(next);
+            self.start_pending_message(next);
         }
+    }
+
+    fn steer_run(&mut self, request: SteeringRequest) {
+        // A plan-mode transition needs a fresh run with rebuilt tool policy.
+        // Dedicated permission/ask replies remain separate from chat input.
+        let count = if self.pending_queue.is_empty() && self.ask_queue.is_empty() {
+            self.message_queue
+                .iter()
+                .take_while(|m| {
+                    m.run_mode.is_none_or(|mode| mode == request.run_mode) && !self.want_start
+                })
+                .count()
+        } else {
+            0
+        };
+        let messages = self
+            .message_queue
+            .iter()
+            .take(count)
+            .map(|m| m.message.clone())
+            .collect();
+        if request.reply.send(messages).is_err() || count == 0 {
+            return;
+        }
+        self.flush_assistant();
+        self.finalize_tool_group();
+        self.history = request.messages;
+        for _ in 0..count {
+            let pending = self
+                .message_queue
+                .pop_front()
+                .expect("counted pending messages");
+            self.record_pending_message(pending);
+        }
+        self.last_todo_reminder = None;
+        self.reminder_count = 0;
+        self.reminder_awaiting_progress = false;
+        self.persist();
     }
 
     /// Render a user turn: the prompt line, then one dotted connector row per
@@ -4564,9 +4667,22 @@ impl App {
                             call.diff = diff;
                             call.content = Some(content);
                             group.last_result_error = Some(is_error);
+                            self.refresh_group_row();
+                            return;
                         }
                     }
-                    self.refresh_group_row();
+                    // A standalone edit/write or intervening display block can
+                    // close a group before its batch's results arrive.
+                    for group in &mut self.groups {
+                        if let Some(call) = group.calls.iter_mut().find(|c| c.id == id) {
+                            call.is_error = is_error;
+                            call.diff = diff;
+                            call.content = Some(content);
+                            group.last_result_error = Some(is_error);
+                            self.transcript[group.idx] = group.row(GroupRow::Closed);
+                            break;
+                        }
+                    }
                     return;
                 }
                 self.flush_assistant();
@@ -7010,17 +7126,28 @@ fn strip_system_xml_tags(text: &str) -> String {
 
 fn spawn_run(args: &Arc<OrchestrationArgs>, body: serde_json::Value) -> CurrentRun {
     let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let (steering_tx, steering) = mpsc::unbounded_channel();
     let args = Arc::clone(args);
     let handle = tokio::spawn(async move {
-        let _ = run_orchestration_streamed(&tx, &body, &args).await;
+        let _ = run_orchestration_steered(&tx, &body, &args, Some(&steering_tx)).await;
     });
-    CurrentRun { rx, handle }
+    CurrentRun {
+        rx,
+        steering,
+        handle,
+    }
 }
 
 /// Await the next event of the active run, or park forever when idle.
-async fn next_event(current: &mut Option<CurrentRun>) -> Option<StreamEvent> {
+async fn next_event(current: &mut Option<CurrentRun>) -> RunEvent {
     match current {
-        Some(c) => c.rx.recv().await,
+        Some(c) => tokio::select! {
+            // Preserve event order: commit streamed prose/tool results before
+            // showing the user message accepted at their boundary.
+            biased;
+            event = c.rx.recv() => RunEvent::Stream(event),
+            Some(request) = c.steering.recv() => RunEvent::Steering(request),
+        },
         None => pending().await,
     }
 }
@@ -7946,6 +8073,12 @@ async fn chat_loop<B: Backend>(
         if sync_output {
             let _ = execute!(io::stdout(), BeginSynchronizedUpdate);
         }
+        // Clear inside the synchronized frame too, so the terminal never
+        // presents an empty screen between clearing and repainting. Kitty
+        // still skips synchronized output, as it does for ordinary draws.
+        if app.take_repaint() {
+            apply_repaint(terminal);
+        }
         let draw_result = terminal.draw(|f| draw(f, app)).map_err(|e| e.to_string());
         if sync_output {
             let _ = execute!(io::stdout(), EndSynchronizedUpdate);
@@ -7981,6 +8114,7 @@ async fn chat_loop<B: Backend>(
                                 handle_mouse(app, mouse);
                             }
                         }
+                        Ok(event @ Event::Resize(_, _)) => route_resize_event(app, event),
                         _ => {}
                     }
                 }
@@ -8109,7 +8243,10 @@ async fn chat_loop<B: Backend>(
                 }
             }
             ev = next_event(&mut current) => {
-                apply_stream_event(app, ev, &mut current).await;
+                match ev {
+                    RunEvent::Stream(ev) => apply_stream_event(app, ev, &mut current).await,
+                    RunEvent::Steering(request) => app.steer_run(request),
+                }
                 drain_stream_events(app, &mut current).await;
             }
         }
@@ -8345,6 +8482,14 @@ async fn handle_ask_key(
         return true;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // A docked ask owns the keyboard, and runs before `handle_key`, so the
+    // repaint key has to be honoured here too -- otherwise a broadcast that
+    // lands during a question stays on screen until the question is answered.
+    // Consumed rather than typed into a custom answer.
+    if ctrl && key.code == KeyCode::Char('l') {
+        app.request_repaint();
+        return true;
+    }
     if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
         crate::core::agent::interaction::cancel_all(registry).await;
         app.ask_queue.clear();
@@ -8414,6 +8559,40 @@ fn route_paste_event(app: &mut App, event: Event) {
         for c in text.chars() {
             app.input_insert(c);
         }
+    }
+}
+
+/// Request a repaint even when a resize event reports the current geometry.
+/// Ratatui already handles size changes during `draw`, but a resize can damage
+/// the screen and return to the old size before the next frame is drawn.
+fn route_resize_event(app: &mut App, event: Event) {
+    if !matches!(event, Event::Resize(_, _)) {
+        return;
+    }
+    app.request_repaint();
+}
+
+/// Clear the screen and reset ratatui's diff baseline, so the next `draw`
+/// re-emits every cell instead of only the ones its buffers say changed. This
+/// is what actually erases a foreign write: a `wall(1)` broadcast paints over
+/// the frame without touching either buffer, so the diff alone considers those
+/// cells already correct and would leave the damage there for the session.
+///
+/// `Terminal::resize` rather than `Terminal::clear`: both clear and reset the
+/// baseline, but `clear` first asks the backend for the cursor position, which
+/// on crossterm is a DSR (`\x1b[6n`) round trip -- a *blocking* read of up to
+/// two seconds. A terminal that never answers (a pipe, a multiplexer that
+/// swallows it, or one whose reply our own event reader already consumed)
+/// would stall streaming and input for that long and then skip the clear
+/// anyway, which is the frozen-UI failure this key exists to fix. `size` is a
+/// `TIOCGWINSZ` ioctl with no round trip, so the repaint stays immediate.
+///
+/// Best-effort like the synchronized-update markers: a terminal that refuses
+/// its size is not reason enough to end the session, and the next frame still
+/// draws.
+fn apply_repaint<B: Backend>(terminal: &mut Terminal<B>) {
+    if let Ok(size) = terminal.size() {
+        let _ = terminal.resize(size.into());
     }
 }
 
@@ -8722,6 +8901,17 @@ async fn handle_key(
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Ctrl-L is the readline/less spelling of "redraw", and it is deliberately
+    // ahead of every mode guard below: the screen can be damaged by a foreign
+    // write (a `wall(1)` broadcast) at any moment, including while a prompt or
+    // picker owns the keyboard, so the recovery key has to work in all of them.
+    // Repainting touches nothing but the display -- the draft, scroll position,
+    // and any in-flight turn are left exactly as they were.
+    if ctrl && key.code == KeyCode::Char('l') {
+        app.request_repaint();
+        return;
+    }
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let sup = key.modifiers.contains(KeyModifiers::SUPER);
     // A modified Enter is a newline, never a submit or a completion, so the
@@ -8798,21 +8988,18 @@ async fn handle_key(
         return;
     }
 
-    // A pending permission prompt captures y/a/n; Ctrl-C cancels the run and
-    // Ctrl-D quits, so it can't be wedged waiting on an unanswered prompt.
-    // Several subagents can have requests queued at once (see `pending_queue`),
-    // so cancelling/quitting denies all of them, not just the one on screen.
+    // A pending permission prompt captures y/a/n; Ctrl-C or Ctrl-D cancels the
+    // run and denies everything queued, so it can't be wedged waiting on an
+    // unanswered prompt. Several subagents can have requests queued at once
+    // (see `pending_queue`), so cancelling denies all of them, not just the
+    // one on screen. Quitting itself stays with the two-press exit below.
     if !app.pending_queue.is_empty() {
         if ctrl_c || ctrl_d {
             for pending in app.pending_queue.drain(..) {
                 deny(registry, &pending.request_id).await;
             }
             abort_run(current);
-            if ctrl_d {
-                app.should_quit = true;
-            } else {
-                app.cancel_run();
-            }
+            app.cancel_run();
             return;
         }
         let pending = app
@@ -8863,13 +9050,8 @@ async fn handle_key(
         return;
     }
 
-    // Ctrl-D quits from anywhere; Ctrl-C cancels a run, clears a draft, or (on
-    // a blank idle composer, and only on a second press) quits.
-    if ctrl_d {
-        abort_run(current);
-        app.should_quit = true;
-        return;
-    }
+    // Ctrl-C and Ctrl-D both cancel a run, clear a draft, or (on a blank idle
+    // composer, and only on a second press) quit.
 
     // An open picker owns navigation/Enter/Esc. One-shot pickers (thread/model)
     // act and close; the `/mcp` picker toggles the selected row in place.
@@ -9184,7 +9366,7 @@ async fn handle_key(
                 app.picker = None;
                 app.mcp_detail = None;
             }
-            _ if ctrl_c => {
+            _ if ctrl_c || ctrl_d => {
                 app.plugin_collection_url = None;
                 app.picker = None;
                 app.mcp_detail = None;
@@ -9193,7 +9375,7 @@ async fn handle_key(
         }
         return;
     }
-    if ctrl_c {
+    if ctrl_c || ctrl_d {
         if app.status == Status::Running {
             // Cancel-first: an in-flight task is what Ctrl-C interrupts, and
             // the session stays open with the partial turn intact.
@@ -9209,9 +9391,9 @@ async fn handle_key(
         } else if app.exit_armed {
             app.should_quit = true;
         } else {
-            // Blank and idle: leaving takes a deliberate second Ctrl-C.
+            // Blank and idle: leaving takes a deliberate second Ctrl-C/Ctrl-D.
             app.exit_armed = true;
-            app.system(Level::Warn, "press Ctrl-C again to quit");
+            app.system(Level::Warn, "press Ctrl-C or Ctrl-D again to quit");
         }
         return;
     }
@@ -9787,7 +9969,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/cancel",
         hint: "[N]",
-        description: "Cancel queued messages (bare: all, or index)",
+        description: "Cancel pending messages (bare: all, or index)",
         alias_of: None,
     },
     SlashCommand {
@@ -9915,13 +10097,14 @@ const KEY_BINDINGS: &[(&str, &str)] = &[
     ("PgUp/PgDn", "Scroll the transcript"),
     ("Ctrl-O", "Expand or collapse all tool calls"),
     ("Ctrl-V", "Paste an image from the clipboard"),
+    ("Ctrl-L", "Redraw the screen (repairs a broadcast over it)"),
     ("Shift+Tab", "Cycle reasoning effort (low/medium/high)"),
     ("Alt+T", "Toggle reasoning effort (low / last)"),
     (
         "Drag",
         "Select text, copied on release (Alt+drag for a block)",
     ),
-    ("Ctrl-D, or Ctrl-C twice", "Quit"),
+    ("Ctrl-C/Ctrl-D twice", "Quit"),
 ];
 
 /// Split a command line into `(name, arg)`, UTF-8 safe (no byte slicing).
@@ -11655,13 +11838,13 @@ async fn todo_command(app: &mut App, arg: &str) {
 /// message. Notes the result or when the queue is empty.
 fn cancel_command(app: &mut App, arg: &str) {
     if app.message_queue.is_empty() {
-        app.note("no queued messages to cancel");
+        app.note("no pending messages to cancel");
         return;
     }
     if arg.is_empty() {
         let n = app.message_queue.len();
         app.message_queue.clear();
-        app.note(&format!("cancelled all {n} queued message(s)"));
+        app.note(&format!("cancelled all {n} pending message(s)"));
         return;
     }
     // Try to parse as a 1-indexed position
@@ -11675,7 +11858,7 @@ fn cancel_command(app: &mut App, arg: &str) {
         }
         let removed = app.message_queue.remove(idx - 1);
         if let Some(text) = removed {
-            let preview = truncate(&text, 40);
+            let preview = truncate(&text.text, 40);
             app.note(&format!(
                 "cancelled message #{idx}: \"{preview}\" ({} remaining)",
                 app.message_queue.len()
@@ -16079,7 +16262,7 @@ fn input_box(app: &App) -> Paragraph<'static> {
                 }
             }
             spans.push(Span::styled(
-                " (Esc to cancel, type to queue next message)",
+                " (Esc to cancel, type to steer the agent)",
                 Style::new().dim().italic(),
             ));
             Paragraph::new(Line::from(spans)).block(block)
@@ -16088,7 +16271,7 @@ fn input_box(app: &App) -> Paragraph<'static> {
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("{} ", app.spinner()), Style::new().yellow()),
                 Span::styled(
-                    format!("⏳ Queued ({n}) — Esc to cancel, type to add more"),
+                    format!("⏳ Pending ({n}) — /cancel to remove, type to steer"),
                     Style::new().yellow(),
                 ),
             ]))
@@ -16106,7 +16289,7 @@ fn input_box(app: &App) -> Paragraph<'static> {
         // Same `> ` prompt as the typing view, then a fixed (non-blinking)
         // block cursor in front of the placeholder.
         let placeholder = if app.status == Status::Running {
-            "Type to queue next message"
+            "Type to steer the agent"
         } else {
             "Type here to chat with agent"
         };
@@ -16237,7 +16420,7 @@ fn footer_spans(app: &App) -> Vec<Span<'static>> {
                 s.insert(
                     0,
                     Span::styled(
-                        format!("⏳ Queued ({queue_count})  "),
+                        format!("⏳ Pending ({queue_count})  "),
                         Style::new().yellow().bold(),
                     ),
                 );
@@ -16256,7 +16439,7 @@ fn footer_spans(app: &App) -> Vec<Span<'static>> {
                 s.insert(
                     0,
                     Span::styled(
-                        format!("⏳ Queued ({queue_count})  "),
+                        format!("⏳ Pending ({queue_count})  "),
                         Style::new().yellow().bold(),
                     ),
                 );
@@ -16285,26 +16468,28 @@ mod tests {
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
     }
     use super::journal::{self, DisplayEntry};
-    use super::SessionLimits;
+    use super::{cancel_command, next_event, RunEvent, SessionLimits, SteeringRequest};
+    use tokio::sync::mpsc;
     use super::{
         age_closed_todos, alt_scroll_restore, alt_scroll_save_off, answer_without_reasoning,
-        apply_resume, apply_stream_event, assistant_is_awaiting_user_answer, assistant_runs,
-        autoscroll_selection, await_branch_poll, backgrounded_job_id, brand, build_user_message,
-        clipboard_path, compact_tokens, context_lines, diff_lines, drain_stream_events,
-        estimate_token_count, finish_account_login, finish_compaction, finish_context_report,
-        finish_login, finish_plugin_install, finish_tokamak_login, finish_update_install,
-        format_tokens, group_detail_lines, group_summary, handle_ask_key, handle_ask_mouse,
-        handle_key, handle_mouse, header_spans, image_mime, image_mime_of, input_content_lines,
-        load_first_file_image, load_image_file, message_text, note_update, open_config_screen,
-        open_rewind_picker, pairs_to_str, parse_command, partial_json_field,
-        provider_label_for_model, rebuild_recall, replay_display_log, restore_goal,
-        restore_run_mode, restore_todos, resume_hint, rewind_to, route_paste_event, row_width,
-        run_command, running_group_rows, selection_text, spans_width, spawn_branch_poll,
-        split_reasoning, starting_call_lines, startup_modes, strip_system_xml_tags,
-        subagent_activity, subagent_name_from_run_id, summarize_result, sync_output_for,
-        thinking_open, tilde_path, tokens_per_second, tool_activity, tool_finished,
-        transcript_top_padding, unescape_partial_json_string, user_content_parts, wave_sweep_line,
-        with_wave_glyph, without_think_tags, App, CompactKind, ContextReport, ContextSegment,
+        apply_repaint, apply_resume, apply_stream_event, assistant_is_awaiting_user_answer,
+        assistant_runs, autoscroll_selection, await_branch_poll, backgrounded_job_id, brand,
+        build_user_message, clipboard_path, compact_tokens, context_lines, diff_lines,
+        drain_stream_events, estimate_token_count, finish_account_login, finish_compaction,
+        finish_context_report, finish_login, finish_plugin_install, finish_tokamak_login,
+        finish_update_install, format_tokens, group_detail_lines, group_summary,
+        handle_ask_key, handle_ask_mouse, handle_key, handle_mouse, header_spans, image_mime,
+        image_mime_of, input_content_lines, load_first_file_image, load_image_file,
+        message_text, note_update, open_config_screen, open_rewind_picker, pairs_to_str,
+        parse_command, partial_json_field, provider_label_for_model, rebuild_recall,
+        replay_display_log, restore_goal, restore_run_mode, restore_todos, resume_hint,
+        rewind_to, route_paste_event, row_width, run_command,
+        running_group_rows, selection_text, spans_width, spawn_branch_poll, split_reasoning,
+        starting_call_lines, startup_modes, strip_system_xml_tags, subagent_activity,
+        subagent_name_from_run_id, summarize_result, sync_output_for, thinking_open,
+        tilde_path, tokens_per_second, tool_activity, tool_finished, transcript_top_padding,
+        unescape_partial_json_string, user_content_parts, wave_sweep_line, with_wave_glyph,
+        without_think_tags, App, CompactKind, ContextReport, ContextSegment,
         ContextView, CurrentRun, McpField, McpPrompt, Pending, PendingImage, PickerKind,
         ProviderField, ReasoningSeg, ResumeTarget, Row, RowKind, Selection, SelectionMode,
         SnapshotJob, Status, AGENT_SETTINGS, ALT_SCROLL_RESTORE, ALT_SCROLL_SAVE_OFF, COPY_NOTICE,
@@ -16403,6 +16588,251 @@ mod tests {
             None,
         );
         TestApp { app, _dir: dir }
+    }
+
+    fn steering_request(
+        messages: Vec<serde_json::Value>,
+    ) -> (
+        SteeringRequest,
+        tokio::sync::oneshot::Receiver<Vec<serde_json::Value>>,
+    ) {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        (
+            SteeringRequest {
+                messages,
+                reply,
+                run_mode: crate::core::agent::plan::RunMode::Normal,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn steering_preserves_images_paths_order_and_transcript_once() {
+        let mut app = test_app();
+        let files = tempfile::tempdir().unwrap();
+        app.project_root = files.path().to_path_buf();
+        std::fs::write(files.path().join("note.txt"), "original context").unwrap();
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.pending_images.push(PendingImage {
+            name: "pic.png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        });
+        app.submit_user("read @note.txt".into());
+        app.submit_user("then test".into());
+        assert!(app.pending_images.is_empty());
+        assert_eq!(app.history.len(), 1);
+        std::fs::write(files.path().join("note.txt"), "changed later").unwrap();
+        let (request, mut receiver) = steering_request(app.history.clone());
+        app.steer_run(request);
+        let messages = receiver.try_recv().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("original context"));
+        assert_eq!(
+            messages[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+        assert_eq!(messages[1]["content"], "then test");
+        assert_eq!(app.history.len(), 3);
+        assert!(app.message_queue.is_empty());
+        assert_eq!(
+            app.display_log
+                .iter()
+                .filter(|e| matches!(e, DisplayEntry::User { .. }))
+                .count(),
+            3
+        );
+        let (request, mut receiver) = steering_request(app.history.clone());
+        app.steer_run(request);
+        assert!(receiver.try_recv().unwrap().is_empty());
+        assert_eq!(app.history.len(), 3);
+    }
+
+    #[test]
+    fn steering_cancel_removes_only_pending_input() {
+        let mut app = test_app();
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.submit_user("remove me".into());
+        app.submit_user("keep me".into());
+        cancel_command(&mut app, "1");
+        let (request, mut receiver) = steering_request(app.history.clone());
+        app.steer_run(request);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            vec![json!({"role": "user", "content": "keep me"})]
+        );
+    }
+
+    #[test]
+    fn steering_does_not_answer_or_bypass_a_permission_prompt() {
+        let mut app = test_app();
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.submit_user("correction".into());
+        app.pending_queue.push_back(pending(false));
+        let (request, mut receiver) = steering_request(app.history.clone());
+        app.steer_run(request);
+        assert!(receiver.try_recv().unwrap().is_empty());
+        assert_eq!(app.pending_queue.len(), 1);
+        assert_eq!(app.message_queue.len(), 1);
+    }
+
+    #[test]
+    fn steering_failed_handoff_keeps_input_for_next_turn() {
+        let mut app = test_app();
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.submit_user("late follow-up".into());
+        let (request, receiver) = steering_request(app.history.clone());
+        drop(receiver);
+        app.steer_run(request);
+        assert_eq!(app.message_queue.len(), 1);
+        assert_eq!(app.history.len(), 1);
+        app.on_done("stop".into(), None);
+        assert!(app.message_queue.is_empty());
+        assert_eq!(app.history.last().unwrap()["content"], "late follow-up");
+        assert!(app.want_start);
+    }
+
+    #[test]
+    fn steering_plan_transition_waits_for_a_new_run() {
+        let mut app = test_app();
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.run_mode = crate::core::agent::plan::RunMode::Plan;
+        app.submit_user("plan only".into());
+        let (request, mut receiver) = steering_request(app.history.clone());
+        app.steer_run(request);
+        assert!(receiver.try_recv().unwrap().is_empty());
+        assert_eq!(app.message_queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn steering_waits_until_earlier_stream_events_are_rendered() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (steering_tx, steering) = mpsc::unbounded_channel();
+        tx.send(StreamEvent::Token {
+            text: "answer".into(),
+        })
+        .unwrap();
+        let (request, _receiver) = steering_request(vec![]);
+        steering_tx.send(request).unwrap();
+        let mut current = Some(CurrentRun {
+            rx,
+            steering,
+            handle: tokio::spawn(async {}),
+        });
+        assert!(matches!(
+            next_event(&mut current).await,
+            RunEvent::Stream(Some(StreamEvent::Token { .. }))
+        ));
+        assert!(matches!(
+            next_event(&mut current).await,
+            RunEvent::Steering(_)
+        ));
+    }
+
+    #[test]
+    fn steering_error_and_cancel_fallback_keep_attachments() {
+        for cancel in [false, true] {
+            let mut app = test_app();
+            app.submit_user("start".into());
+            app.want_start = false;
+            app.pending_images.push(PendingImage {
+                name: "pic.png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+            app.submit_user("follow-up".into());
+            if cancel {
+                app.cancel_run();
+            } else {
+                app.on_error("error".into(), "offline".into());
+            }
+            assert!(app.message_queue.is_empty());
+            assert!(app.want_start);
+            assert_eq!(
+                app.history.last().unwrap()["content"][1]["image_url"]["url"],
+                "data:image/png;base64,AAAA"
+            );
+        }
+    }
+
+    #[test]
+    fn steering_session_reset_discards_old_pending_input() {
+        let mut app = test_app();
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.submit_user("old session only".into());
+        app.reset_session();
+        let (request, mut receiver) = steering_request(vec![]);
+        app.steer_run(request);
+        assert!(receiver.try_recv().unwrap().is_empty());
+        assert!(app.history.is_empty());
+        assert!(app.message_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_consumed_input_survives_resume_once() {
+        let mut app = test_app();
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.submit_user("correction".into());
+        let (request, mut receiver) = steering_request(app.history.clone());
+        app.steer_run(request);
+        assert_eq!(receiver.try_recv().unwrap().len(), 1);
+        app.join_journal();
+        let mut restored = test_app();
+        restored.agent_dir = app.agent_dir.clone();
+        apply_resume(&mut restored, &ResumeTarget::Latest).await;
+        assert_eq!(
+            restored
+                .history
+                .iter()
+                .filter(|m| m["content"] == "correction")
+                .count(),
+            1
+        );
+        assert_eq!(
+            restored
+                .display_log
+                .iter()
+                .filter(|e| matches!(e, DisplayEntry::User { text, .. } if text == "correction"))
+                .count(),
+            1
+        );
+        assert!(restored.message_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_expands_skill_input_without_resetting_the_run() {
+        let (mut app, root) = skill_test_app("deploy", "How to deploy.");
+        app.submit_user("start".into());
+        app.want_start = false;
+        app.pending_images.push(PendingImage {
+            name: "pic.png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        });
+        app.submit_user("please /skill:deploy carefully".into());
+        let (request, mut receiver) = steering_request(app.history.clone());
+        app.steer_run(request);
+        let messages = receiver.try_recv().unwrap();
+        assert!(messages[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("User: please carefully"));
+        assert_eq!(
+            messages[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+        assert!(!app.want_start);
+        assert!(transcript_text(&app).contains("[skill:deploy] please carefully"));
+        app.join_journal();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// App whose project has one installed skill `<name>/SKILL.md` with the
@@ -19543,10 +19973,10 @@ mod tests {
         assert_eq!(app.input, "never submitted", "the draft must be recallable");
     }
 
-    /// Leaving a blank idle TUI takes a deliberate second Ctrl-C; the first
-    /// only arms the exit, and typing again disarms it.
+    /// Leaving a blank idle TUI takes a deliberate second Ctrl-C or Ctrl-D;
+    /// the first only arms the exit, and typing again disarms it.
     #[tokio::test]
-    async fn quitting_a_blank_idle_tui_takes_a_second_ctrl_c() {
+    async fn quitting_a_blank_idle_tui_takes_a_second_ctrl_c_or_ctrl_d() {
         let mut app = test_app();
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL).await;
         assert!(!app.should_quit, "the first Ctrl-C only arms the exit");
@@ -19561,6 +19991,13 @@ mod tests {
         press(&mut app, KeyCode::Backspace, KeyModifiers::NONE).await;
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL).await;
         assert!(!app.should_quit, "typing must disarm the pending exit");
+
+        // Ctrl-D shares the same two-press exit as Ctrl-C.
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL).await;
+        assert!(!app.should_quit, "the first Ctrl-D only arms the exit");
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL).await;
+        assert!(app.should_quit, "the second Ctrl-D quits");
     }
 
     /// The closing hint is copyable as-is and names the same short thread id
@@ -24459,6 +24896,131 @@ mod tests {
             .any(|l| l.contains("let me look")));
     }
 
+    #[tokio::test]
+    async fn streamed_reasoning_before_mixed_tool_batch_keeps_results_paired() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Exercise the real HTTP normalizer, including started/argument events.
+        // The loop emits all authoritative calls before executing the batch.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let mut used = 0;
+            loop {
+                let n = socket.read(&mut request[used..]).await.unwrap();
+                assert_ne!(n, 0);
+                used += n;
+                if request[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                request.resize(request.len() * 2, 0);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            for delta in [
+                json!({"reasoning_content": "inspect before changing"}),
+                json!({"tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"first\"}"}}]}),
+                json!({"tool_calls": [{"index": 1, "id": "c2", "type": "function", "function": {"name": "write", "arguments": "{\"path\":\"second.rs\",\"content\":\"new\"}"}}]}),
+                json!({"tool_calls": [{"index": 2, "id": "c3", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"third.rs\"}"}}]}),
+            ] {
+                let chunk = json!({"choices": [{"index": 0, "delta": delta}]});
+                socket
+                    .write_all(format!("data: {chunk}\n\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            socket.write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let completion = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::core::agent::genai_bridge::stream_chat_completions(
+                &reqwest13::Client::new(),
+                &format!("http://{addr}/v1/chat/completions"),
+                &[],
+                None,
+                &json!({"model": "m", "messages": [{"role": "user", "content": "go"}]}),
+                &tx,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        drop(tx);
+
+        let mut app = test_app();
+        while let Some(event) = rx.recv().await {
+            app.apply(event);
+        }
+        // The real streamed reasoning precedes the in-progress tool display.
+        app.toggle_regions();
+        let live = render_rows(&mut app, 120, 50).join("\n");
+        assert!(live.contains("inspect before changing"), "{live}");
+        assert!(live.contains("Preparing bash"), "{live}");
+        assert!(
+            live.find("inspect before changing").unwrap() < live.find("Preparing bash").unwrap(),
+            "{live}"
+        );
+        app.toggle_regions();
+
+        for call in completion["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+        {
+            app.apply(StreamEvent::ToolCall {
+                id: call["id"].as_str().unwrap().into(),
+                name: call["function"]["name"].as_str().unwrap().into(),
+                args: serde_json::from_str(call["function"]["arguments"].as_str().unwrap())
+                    .unwrap(),
+            });
+        }
+        // A standalone write closes c1's group before any batch result arrives.
+        // Resolve the later group first to detect attaching to the wrong owner.
+        for (id, content, is_error) in [
+            ("c3", "third result", false),
+            ("c1", "first failed", true),
+            ("c2", "second result", false),
+        ] {
+            app.apply(StreamEvent::ToolResult {
+                id: id.into(),
+                content: content.into(),
+                is_error,
+                diff: None,
+            });
+        }
+        let closed = &app.groups[0];
+        assert!(row_text(&app.transcript[closed.idx]).contains('✗'));
+        let first = group_detail_lines(closed, 120)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let third = group_detail_lines(app.tool_group.as_ref().unwrap(), 120)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            first.contains("first failed") && !first.contains("third result"),
+            "{first}"
+        );
+        assert!(
+            third.contains("third result") && !third.contains("first failed"),
+            "{third}"
+        );
+        app.toggle_regions();
+        let open_idx = app.tool_group.as_ref().unwrap().idx;
+        app.toggle_region(open_idx);
+        let rendered = render_rows(&mut app, 120, 50).join("\n");
+        let reasoning = rendered.find("inspect before changing").unwrap();
+        let first = rendered.find("first failed").unwrap();
+        let third = rendered.find("third result").unwrap();
+        assert!(reasoning < first && first < third, "{rendered}");
+    }
+
     #[test]
     fn reasoning_row_is_separated_from_following_prose_by_a_blank_line() {
         let mut app = test_app();
@@ -25394,6 +25956,253 @@ mod tests {
         assert_eq!(app.copy_notice(), None);
     }
 
+    /// The bug this exists for: a foreign write to the TTY (`wall(1)`) damages
+    /// the physical screen without touching either of ratatui's buffers, so the
+    /// per-cell diff considers those cells already correct and never repaints
+    /// them -- the damage is permanent for the session. Simulated by writing
+    /// straight to the backend (`Backend::draw` is what the real terminal write
+    /// amounts to: it changes the screen, not the buffers). First half asserts
+    /// the bug is real under a plain redraw; second half asserts the repaint
+    /// path repairs it.
+    #[test]
+    fn repaint_restores_cells_a_foreign_write_corrupted() {
+        use ratatui::backend::Backend as _;
+        use ratatui::buffer::Cell;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = test_app();
+        app.submit_user("what does this project do".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        let clean = terminal.backend().buffer().clone();
+
+        // Pick a cell the frame actually painted, so a restored value is
+        // distinguishable from an incidentally blank one.
+        let (cx, cy) = (0..clean.area.height)
+            .flat_map(|y| (0..clean.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| clean[(x, y)].symbol().trim() != "")
+            .expect("the frame must paint something");
+
+        let mut broadcast = Cell::EMPTY;
+        broadcast.set_symbol("W");
+        terminal
+            .backend_mut()
+            .draw(std::iter::once((cx, cy, &broadcast)))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(cx, cy)].symbol(),
+            "W",
+            "the simulated broadcast must actually land on the screen"
+        );
+
+        // The bug: an ordinary redraw diffs identical buffers, emits nothing,
+        // and leaves the broadcast sitting on the frame.
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(cx, cy)].symbol(),
+            "W",
+            "a plain redraw is expected to leave foreign damage in place"
+        );
+
+        // The fix: the repaint resets the diff baseline, so the next frame
+        // re-emits every cell and the damage is gone.
+        app.request_repaint();
+        assert!(app.take_repaint());
+        apply_repaint(&mut terminal);
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer(),
+            &clean,
+            "a repaint must restore the frame the broadcast damaged"
+        );
+    }
+
+    /// A backend that counts cursor-position queries and otherwise behaves
+    /// exactly like `TestBackend`. `Terminal::clear` issues one; on crossterm
+    /// that is a DSR (`\x1b[6n`) round trip, which `read_position_raw` waits
+    /// on for up to two seconds.
+    struct CountingBackend {
+        inner: ratatui::backend::TestBackend,
+        cursor_queries: std::cell::Cell<usize>,
+    }
+
+    impl ratatui::backend::Backend for CountingBackend {
+        type Error = <ratatui::backend::TestBackend as ratatui::backend::Backend>::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+
+        fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+            self.cursor_queries.set(self.cursor_queries.get() + 1);
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear()
+        }
+
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
+
+    /// `apply_repaint` must never ask the backend where the cursor is.
+    /// `Terminal::clear` does, and on crossterm that DSR round trip blocks this
+    /// single-threaded loop for up to two seconds against a terminal that does
+    /// not answer -- freezing streaming and input, and then skipping the clear
+    /// anyway. Measured at 2.04s against an unresponsive PTY before this was
+    /// switched to the size-based path, versus 0.06s once it was.
+    #[test]
+    fn repaint_never_blocks_on_a_cursor_query() {
+        use ratatui::backend::Backend as _;
+        use ratatui::Terminal;
+
+        let mut app = test_app();
+        let backend = CountingBackend {
+            inner: ratatui::backend::TestBackend::new(60, 30),
+            cursor_queries: std::cell::Cell::new(0),
+        };
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        let clean = terminal.backend().inner.buffer().clone();
+
+        // Damage the screen the way a `wall(1)` broadcast does.
+        let (cx, cy) = (0..clean.area.height)
+            .flat_map(|y| (0..clean.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| clean[(x, y)].symbol().trim() != "")
+            .expect("the frame must paint something");
+        let mut broadcast = ratatui::buffer::Cell::EMPTY;
+        broadcast.set_symbol("W");
+        terminal
+            .backend_mut()
+            .draw(std::iter::once((cx, cy, &broadcast)))
+            .unwrap();
+
+        let before = terminal.backend().cursor_queries.get();
+        apply_repaint(&mut terminal);
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        let asked = terminal.backend().cursor_queries.get() - before;
+
+        assert_eq!(
+            asked, 0,
+            "the repaint must not issue a cursor-position query: on crossterm \
+             that is a blocking DSR round trip on the render loop"
+        );
+        assert_eq!(
+            terminal.backend().inner.buffer(),
+            &clean,
+            "and it must still restore the frame the broadcast damaged"
+        );
+    }
+
+    /// A repaint is a display operation and nothing more: a user pressing
+    /// Ctrl-L mid-draft must not lose the draft or have the transcript jump.
+    #[tokio::test]
+    async fn composer_draft_and_scroll_survive_a_repaint() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = test_app();
+        for i in 0..40 {
+            app.submit_user(format!("message {i}"));
+        }
+        app.input = "a draft mid-sentence".to_string();
+        app.scrollback = 7;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        let before = terminal.backend().buffer().clone();
+
+        let registry: PermissionRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let mcp_servers: crate::core::state::SharedMcpServers =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let mut current: Option<CurrentRun> = None;
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_l, &registry, &mut current, &mcp_servers).await;
+
+        assert_eq!(app.input, "a draft mid-sentence", "the draft must survive");
+        assert_eq!(app.scrollback, 7, "the scroll position must survive");
+
+        // And the repainted frame is the same frame, redrawn -- not a scrolled
+        // or emptied one.
+        assert!(app.take_repaint());
+        apply_repaint(&mut terminal);
+        terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer(),
+            &before,
+            "a repaint must reproduce the same frame"
+        );
+    }
+
+    /// A docked ask owns the keyboard and runs before `handle_key`, so it has
+    /// to honour the repaint key itself -- a broadcast landing during a
+    /// question would otherwise stay on screen until it is answered. The key is
+    /// consumed, never typed into a custom answer, and the question survives.
+    #[tokio::test]
+    async fn ctrl_l_repaints_while_an_ask_owns_the_keyboard() {
+        let mut app = test_app();
+        let registry = crate::core::agent::interaction::new_registry();
+        let (request_id, _receiver) = crate::core::agent::interaction::register(&registry).await;
+        app.apply(StreamEvent::AskRequest {
+            request_id,
+            request: ask_request(false, false),
+            timeout_secs: None,
+        });
+        let ask = app.ask_queue.front_mut().unwrap();
+        ask.editing_custom = true;
+        ask.custom_input = "answer in progress".into();
+
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(
+            handle_ask_key(&mut app, ctrl_l, &registry).await,
+            "the ask must consume Ctrl-L rather than pass it on"
+        );
+        assert!(app.take_repaint(), "Ctrl-L must repaint during an ask");
+        assert!(
+            !app.ask_queue.is_empty(),
+            "a repaint must not answer or dismiss the question"
+        );
+        assert_eq!(
+            app.ask_queue.front().unwrap().custom_input,
+            "answer in progress",
+            "a repaint must preserve the answer being edited"
+        );
+    }
+
     #[tokio::test]
     async fn mouse_tracking_has_no_toggle_hotkey() {
         assert!(
@@ -25820,7 +26629,7 @@ mod tests {
             with_wave_glyph(None, || {
                 render_rows(app, 80, 12)
                     .into_iter()
-                    .find(|r| r.contains("(Esc to cancel, type to queue next message)"))
+                    .find(|r| r.contains("(Esc to cancel, type to steer the agent)"))
                     .expect("running placeholder present")
             })
         };
@@ -25848,7 +26657,7 @@ mod tests {
         assert_ne!(first, later, "row must change as the frame advances");
 
         assert!(
-            later.contains("(Esc to cancel, type to queue next message)"),
+            later.contains("(Esc to cancel, type to steer the agent)"),
             "{later:?}"
         );
     }
@@ -25867,7 +26676,7 @@ mod tests {
         let row = with_wave_glyph(None, || {
             render_rows(&mut app, 80, 12)
                 .into_iter()
-                .find(|r| r.contains("(Esc to cancel, type to queue next message)"))
+                .find(|r| r.contains("(Esc to cancel, type to steer the agent)"))
                 .expect("running placeholder present")
         });
         assert!(
@@ -25921,7 +26730,7 @@ mod tests {
             let row = with_wave_glyph(None, || {
                 render_rows(&mut app, 80, 12)
                     .into_iter()
-                    .find(|r| r.contains("(Esc to cancel, type to queue next message)"))
+                    .find(|r| r.contains("(Esc to cancel, type to steer the agent)"))
                     .expect("running placeholder present")
             });
             WORKING_WORDS
@@ -25944,7 +26753,7 @@ mod tests {
         app.spinner_frame = 5;
         let row = render_rows(&mut app, 80, 12)
             .into_iter()
-            .find(|r| r.contains("Queued"))
+            .find(|r| r.contains("Pending"))
             .expect("queued row present");
         assert!(row.contains(SPINNER[5]), "expected frame 5 glyph: {row:?}");
     }
@@ -25966,7 +26775,7 @@ mod tests {
         let row = with_wave_glyph(None, || {
             render_rows(&mut app, 80, 12)
                 .into_iter()
-                .find(|r| r.contains("(Esc to cancel, type to queue next message)"))
+                .find(|r| r.contains("(Esc to cancel, type to steer the agent)"))
                 .expect("running placeholder present")
         });
         assert!(
@@ -27017,6 +27826,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut current = Some(CurrentRun {
             rx,
+            steering: mpsc::unbounded_channel().1,
             handle: tokio::spawn(async {}),
         });
 
@@ -27050,6 +27860,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut current = Some(CurrentRun {
             rx,
+            steering: mpsc::unbounded_channel().1,
             handle: tokio::spawn(async {}),
         });
         for _ in 0..(super::EVENT_DRAIN_MAX + 50) {
@@ -27070,6 +27881,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut current = Some(CurrentRun {
             rx,
+            steering: mpsc::unbounded_channel().1,
             handle: tokio::spawn(async {}),
         });
         tx.send(StreamEvent::Token { text: "hi".into() })
@@ -28619,7 +29431,7 @@ mod tests {
         assert!(
             app.message_queue
                 .iter()
-                .any(|m| m.as_str() == "Proceed with the plan."),
+                .any(|m| m.text == "Proceed with the plan."),
             "execute must queue a continuation turn"
         );
         let answers = receiver.await.unwrap().unwrap();

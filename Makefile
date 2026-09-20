@@ -523,7 +523,7 @@ build-cli-dev:
 	$(call MKDIR,'src-tauri/resources/bin')	
 	cd src-tauri && cargo build --no-default-features --features cli --bin jan
 ifeq ($(DETECTED_OS),Windows)
-	copy src-tauri\target\debug\jan.exe src-tauri\resources\bin\jan.exe
+	   cp src-tauri/target/debug/jan.exe src-tauri/resources/bin/jan.exe
 else
 	install -m755 src-tauri/target/debug/jan src-tauri/resources/bin/jan
 endif
